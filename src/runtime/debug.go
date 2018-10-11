@@ -28,6 +28,9 @@ func GOMAXPROCS(n int) int {
 	newprocs = int32(n)
 
 	startTheWorld()
+
+	gopool.RefreshDefaultPool()
+
 	return ret
 }
 
