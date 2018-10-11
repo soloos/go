@@ -28,6 +28,7 @@ func GOMAXPROCS(n int) int {
 	newprocs = int32(n)
 
 	startTheWorld()
+
 	return ret
 }
 
