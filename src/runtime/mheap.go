@@ -317,6 +317,8 @@ type mspan struct {
 	// if sweepgen == h->sweepgen - 2, the span needs sweeping
 	// if sweepgen == h->sweepgen - 1, the span is currently being swept
 	// if sweepgen == h->sweepgen, the span is swept and ready to use
+	// if sweepgen == h->sweepgen + 1, the span was cached before sweep began and is still cached, and needs sweeping
+	// if sweepgen == h->sweepgen + 3, the span was swept and then cached and is still cached
 	// h->sweepgen is incremented by 2 after every GC
 
 	sweepgen    uint32
@@ -324,7 +326,6 @@ type mspan struct {
 	baseMask    uint16     // if non-0, elemsize is a power of 2, & this will get object allocation base
 	allocCount  uint16     // number of allocated objects
 	spanclass   spanClass  // size class and noscan (uint8)
-	incache     bool       // being used by an mcache
 	state       mSpanState // mspaninuse etc
 	needzero    uint8      // needs to be zeroed before allocation
 	divShift    uint8      // for divide by elemsize - divMagic.shift
@@ -656,13 +657,14 @@ func (h *mheap) reclaim(npage uintptr) {
 	lock(&h.lock)
 }
 
-// Allocate a new span of npage pages from the heap for GC'd memory
-// and record its size class in the HeapMap and HeapMapCache.
+// alloc_m is the internal implementation of mheap.alloc.
+//
+// alloc_m must run on the system stack because it locks the heap, so
+// any stack growth during alloc_m would self-deadlock.
+//
+//go:systemstack
 func (h *mheap) alloc_m(npage uintptr, spanclass spanClass, large bool) *mspan {
 	_g_ := getg()
-	if _g_ != _g_.m.g0 {
-		throw("_mheap_alloc not on g0 stack")
-	}
 	lock(&h.lock)
 
 	// To prevent excessive heap growth, before allocating n pages
@@ -671,7 +673,7 @@ func (h *mheap) alloc_m(npage uintptr, spanclass spanClass, large bool) *mspan {
 		// TODO(austin): This tends to sweep a large number of
 		// spans in order to find a few completely free spans
 		// (for example, in the garbage benchmark, this sweeps
-		// ~30x the number of pages its trying to allocate).
+		// ~30x the number of pages it's trying to allocate).
 		// If GC kept a bit for whether there were any marks
 		// in a span, we could release these free spans
 		// at the end of GC and eliminate this entirely.
@@ -751,6 +753,12 @@ func (h *mheap) alloc_m(npage uintptr, spanclass spanClass, large bool) *mspan {
 	return s
 }
 
+// alloc allocates a new span of npage pages from the GC'd heap.
+//
+// Either large must be true or spanclass must indicates the span's
+// size class and scannability.
+//
+// If needzero is true, the memory for the returned span will be zeroed.
 func (h *mheap) alloc(npage uintptr, spanclass spanClass, large bool, needzero bool) *mspan {
 	// Don't do any operations that lock the heap on the G stack.
 	// It might trigger stack growth, and the stack growth code needs
@@ -937,7 +945,10 @@ func (h *mheap) grow(npage uintptr) bool {
 }
 
 // Free the span back into the heap.
-func (h *mheap) freeSpan(s *mspan, acct int32) {
+//
+// large must match the value of large passed to mheap.alloc. This is
+// used for accounting.
+func (h *mheap) freeSpan(s *mspan, large bool) {
 	systemstack(func() {
 		mp := getg().m
 		lock(&h.lock)
@@ -951,7 +962,8 @@ func (h *mheap) freeSpan(s *mspan, acct int32) {
 			bytes := s.npages << _PageShift
 			msanfree(base, bytes)
 		}
-		if acct != 0 {
+		if large {
+			// Match accounting done in mheap.alloc.
 			memstats.heap_objects--
 		}
 		if gcBlackenEnabled != 0 {
@@ -1185,7 +1197,6 @@ func (span *mspan) init(base uintptr, npages uintptr) {
 	span.npages = npages
 	span.allocCount = 0
 	span.spanclass = 0
-	span.incache = false
 	span.elemsize = 0
 	span.state = mSpanDead
 	span.unusedsince = 0
@@ -1437,10 +1448,7 @@ func addfinalizer(p unsafe.Pointer, f *funcval, nret uintptr, fint *_type, ot *p
 			scanobject(base, gcw)
 			// Mark the finalizer itself, since the
 			// special isn't part of the GC'd heap.
-			scanblock(uintptr(unsafe.Pointer(&s.fn)), sys.PtrSize, &oneptrmask[0], gcw)
-			if gcBlackenPromptly {
-				gcw.dispose()
-			}
+			scanblock(uintptr(unsafe.Pointer(&s.fn)), sys.PtrSize, &oneptrmask[0], gcw, nil)
 			releasem(mp)
 		}
 		return true

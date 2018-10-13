@@ -269,7 +269,7 @@ func TestRead0(t *testing.T) {
 	}
 }
 
-// Reading a closed file should should return ErrClosed error
+// Reading a closed file should return ErrClosed error
 func TestReadClosed(t *testing.T) {
 	path := sfdir + "/" + sfname
 	file, err := Open(path)
@@ -2331,5 +2331,19 @@ func TestDoubleCloseError(t *testing.T) {
 		t.Errorf("second Close returned %q, wanted %q", err, ErrClosed)
 	} else {
 		t.Logf("second close returned expected error %q", err)
+	}
+}
+
+func TestUserHomeDir(t *testing.T) {
+	dir := UserHomeDir()
+	if dir == "" {
+		t.Fatal("UserHomeDir returned an empty string")
+	}
+	fi, err := Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.IsDir() {
+		t.Fatalf("dir %s is not directory; type = %v", dir, fi.Mode())
 	}
 }

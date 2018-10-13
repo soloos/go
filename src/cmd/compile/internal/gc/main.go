@@ -207,7 +207,6 @@ func Main(archInit func(*Arch)) {
 	objabi.Flagcount("e", "no limit on number of errors reported", &Debug['e'])
 	objabi.Flagcount("f", "debug stack frames", &Debug['f'])
 	objabi.Flagcount("h", "halt on error", &Debug['h'])
-	objabi.Flagcount("i", "debug line number stack", &Debug['i'])
 	objabi.Flagfn1("importmap", "add `definition` of the form source=actual to import map", addImportMap)
 	objabi.Flagfn1("importcfg", "read import configuration from `file`", readImportCfg)
 	flag.StringVar(&flag_installsuffix, "installsuffix", "", "set pkg directory `suffix`")
@@ -249,7 +248,6 @@ func Main(archInit func(*Arch)) {
 	flag.StringVar(&blockprofile, "blockprofile", "", "write block profile to `file`")
 	flag.StringVar(&mutexprofile, "mutexprofile", "", "write mutex profile to `file`")
 	flag.StringVar(&benchfile, "bench", "", "append benchmark times to `file`")
-	flag.BoolVar(&flagiexport, "iexport", true, "export indexed package data")
 	objabi.Flagparse(usage)
 
 	// Record flags that affect the build result. (And don't
@@ -1129,24 +1127,13 @@ func importfile(f *Val) *types.Pkg {
 			errorexit()
 		}
 
-		// New indexed format is distinguished by an 'i' byte,
-		// whereas old export format always starts with 'c', 'd', or 'v'.
-		if c == 'i' {
-			if !flagiexport {
-				yyerror("import %s: cannot import package compiled with -iexport=true", file)
-				errorexit()
-			}
-
-			iimport(importpkg, imp)
-		} else {
-			if flagiexport {
-				yyerror("import %s: cannot import package compiled with -iexport=false", file)
-				errorexit()
-			}
-
-			imp.UnreadByte()
-			Import(importpkg, imp.Reader)
+		// Indexed format is distinguished by an 'i' byte,
+		// whereas previous export formats started with 'c', 'd', or 'v'.
+		if c != 'i' {
+			yyerror("import %s: unexpected package format byte: %v", file, c)
+			errorexit()
 		}
+		iimport(importpkg, imp)
 
 	default:
 		yyerror("no import in %q", path_)

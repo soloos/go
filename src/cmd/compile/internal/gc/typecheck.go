@@ -87,8 +87,7 @@ var _typekind = []string{
 	TFLOAT64:    "float64",
 	TBOOL:       "bool",
 	TSTRING:     "string",
-	TPTR32:      "pointer",
-	TPTR64:      "pointer",
+	TPTR:        "pointer",
 	TUNSAFEPTR:  "unsafe.Pointer",
 	TSTRUCT:     "struct",
 	TINTER:      "interface",
@@ -748,43 +747,22 @@ func typecheck1(n *Node, top int) *Node {
 			}
 		}
 
-		if et == TSTRING {
-			if iscmp[n.Op] {
-				ot := n.Op
-				n.Op = OCMPSTR
-				n.SetSubOp(ot)
-			} else if n.Op == OADD {
-				// create OADDSTR node with list of strings in x + y + z + (w + v) + ...
-				n.Op = OADDSTR
+		if et == TSTRING && n.Op == OADD {
+			// create OADDSTR node with list of strings in x + y + z + (w + v) + ...
+			n.Op = OADDSTR
 
-				if l.Op == OADDSTR {
-					n.List.Set(l.List.Slice())
-				} else {
-					n.List.Set1(l)
-				}
-				if r.Op == OADDSTR {
-					n.List.AppendNodes(&r.List)
-				} else {
-					n.List.Append(r)
-				}
-				n.Left = nil
-				n.Right = nil
+			if l.Op == OADDSTR {
+				n.List.Set(l.List.Slice())
+			} else {
+				n.List.Set1(l)
 			}
-		}
-
-		if et == TINTER {
-			if l.Op == OLITERAL && l.Val().Ctype() == CTNIL {
-				// swap for back end
-				n.Left = r
-
-				n.Right = l
-			} else if r.Op == OLITERAL && r.Val().Ctype() == CTNIL {
-			} else // leave alone for back end
-			if r.Type.IsInterface() == l.Type.IsInterface() {
-				ot := n.Op
-				n.Op = OCMPIFACE
-				n.SetSubOp(ot)
+			if r.Op == OADDSTR {
+				n.List.AppendNodes(&r.List)
+			} else {
+				n.List.Append(r)
 			}
+			n.Left = nil
+			n.Right = nil
 		}
 
 		if (op == ODIV || op == OMOD) && Isconst(r, CTINT) {
@@ -2436,7 +2414,7 @@ func isMethodApplicable(t *types.Type, m *types.Field) bool {
 }
 
 func derefall(t *types.Type) *types.Type {
-	for t != nil && t.Etype == types.Tptr {
+	for t != nil && t.IsPtr() {
 		t = t.Elem()
 	}
 	return t
@@ -2506,20 +2484,20 @@ func lookdot(n *Node, t *types.Type, dostrcmp int) *types.Field {
 		dowidth(tt)
 		rcvr := f2.Type.Recv().Type
 		if !eqtype(rcvr, tt) {
-			if rcvr.Etype == types.Tptr && eqtype(rcvr.Elem(), tt) {
+			if rcvr.IsPtr() && eqtype(rcvr.Elem(), tt) {
 				checklvalue(n.Left, "call pointer method on")
 				n.Left = nod(OADDR, n.Left, nil)
 				n.Left.SetImplicit(true)
 				n.Left = typecheck(n.Left, Etype|Erv)
-			} else if tt.Etype == types.Tptr && rcvr.Etype != types.Tptr && eqtype(tt.Elem(), rcvr) {
+			} else if tt.IsPtr() && !rcvr.IsPtr() && eqtype(tt.Elem(), rcvr) {
 				n.Left = nod(OIND, n.Left, nil)
 				n.Left.SetImplicit(true)
 				n.Left = typecheck(n.Left, Etype|Erv)
-			} else if tt.Etype == types.Tptr && tt.Elem().Etype == types.Tptr && eqtype(derefall(tt), derefall(rcvr)) {
+			} else if tt.IsPtr() && tt.Elem().IsPtr() && eqtype(derefall(tt), derefall(rcvr)) {
 				yyerror("calling method %v with receiver %L requires explicit dereference", n.Sym, n.Left)
-				for tt.Etype == types.Tptr {
+				for tt.IsPtr() {
 					// Stop one level early for method with pointer receiver.
-					if rcvr.Etype == types.Tptr && tt.Elem().Etype != types.Tptr {
+					if rcvr.IsPtr() && !tt.Elem().IsPtr() {
 						break
 					}
 					n.Left = nod(OIND, n.Left, nil)

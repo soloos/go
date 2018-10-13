@@ -71,9 +71,7 @@ func fnpkg(fn *Node) *types.Pkg {
 func typecheckinl(fn *Node) {
 	lno := setlineno(fn)
 
-	if flagiexport {
-		expandInline(fn)
-	}
+	expandInline(fn)
 
 	// typecheckinl is only for imported functions;
 	// their bodies may refer to unsafe as long as the package
@@ -406,16 +404,6 @@ func (v *hairyVisitor) visit(n *Node) bool {
 	}
 
 	v.budget--
-	// TODO(mdempsky/josharian): Hacks to appease toolstash; remove.
-	// See issue 17566 and CL 31674 for discussion.
-	switch n.Op {
-	case OSTRUCTKEY:
-		v.budget--
-	case OSLICE, OSLICEARR, OSLICESTR:
-		v.budget--
-	case OSLICE3, OSLICE3ARR:
-		v.budget -= 2
-	}
 
 	// When debugging, don't stop early, to get full cost of inlining this function
 	if v.budget < 0 && Debug['m'] < 2 {

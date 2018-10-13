@@ -6,8 +6,7 @@
 // used by the Go standard library.
 package cpu
 
-// DebugOptions is set to true by the runtime if go was compiled with GOEXPERIMENT=debugcpu
-// and GOOS is Linux or Darwin.
+// DebugOptions is set to true by the runtime if the OS supports GODEBUGCPU.
 // This should not be changed after it is initialized.
 var DebugOptions bool
 
@@ -139,8 +138,7 @@ type s390x struct {
 
 // Initialize examines the processor and sets the relevant variables above.
 // This is called by the runtime package early in program initialization,
-// before normal init functions are run. env is set by runtime on Linux and Darwin
-// if go was compiled with GOEXPERIMENT=debugcpu.
+// before normal init functions are run. env is set by runtime if the OS supports GODEBUGCPU.
 func Initialize(env string) {
 	doinit()
 	processOptions(env)
@@ -159,11 +157,11 @@ type option struct {
 }
 
 // processOptions disables CPU feature values based on the parsed env string.
-// The env string is expected to be of the form feature1=0,feature2=0...
+// The env string is expected to be of the form feature1=off,feature2=off...
 // where feature names is one of the architecture specifc list stored in the
-// cpu packages options variable. If env contains all=0 then all capabilities
+// cpu packages options variable. If env contains all=off then all capabilities
 // referenced through the options variable are disabled. Other feature
-// names and values other than 0 are silently ignored.
+// names and values other than 'off' are silently ignored.
 func processOptions(env string) {
 field:
 	for env != "" {
@@ -180,8 +178,8 @@ field:
 		}
 		key, value := field[:i], field[i+1:]
 
-		// Only allow turning off CPU features by specifying '0'.
-		if value == "0" {
+		// Only allow turning off CPU features by specifying 'off'.
+		if value == "off" {
 			if key == "all" {
 				for _, v := range options {
 					*v.Feature = false

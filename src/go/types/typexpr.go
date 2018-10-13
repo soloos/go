@@ -391,7 +391,7 @@ func (check *Checker) arrayLength(e ast.Expr) int64 {
 	}
 	if isUntyped(x.typ) || isInteger(x.typ) {
 		if val := constant.ToInt(x.val); val.Kind() == constant.Int {
-			if representableConst(val, check.conf, Typ[Int], nil) {
+			if representableConst(val, check, Typ[Int], nil) {
 				if n, ok := constant.Int64Val(val); ok && n >= 0 {
 					return n
 				}
@@ -549,6 +549,15 @@ func (check *Checker) interfaceType(ityp *Interface, iface *ast.InterfaceType, d
 		recvTyp = def
 	}
 
+	// Correct receiver type for all methods explicitly declared
+	// by this interface after we're done with type-checking at
+	// this level. See comment below for details.
+	check.later(func() {
+		for _, m := range ityp.methods {
+			m.typ.(*Signature).recv.typ = recvTyp
+		}
+	})
+
 	// collect methods
 	var sigfix []*methodInfo
 	for i, minfo := range info.methods {
@@ -558,9 +567,27 @@ func (check *Checker) interfaceType(ityp *Interface, iface *ast.InterfaceType, d
 			pos := name.Pos()
 			// Don't type-check signature yet - use an
 			// empty signature now and update it later.
-			// Since we know the receiver, set it up now
-			// (required to avoid crash in ptrRecv; see
-			// e.g. test case for issue 6638).
+			// But set up receiver since we know it and
+			// its position, and because interface method
+			// signatures don't get a receiver via regular
+			// type-checking (there isn't a receiver in the
+			// method's AST). Setting the receiver type is
+			// also important for ptrRecv() (see methodset.go).
+			//
+			// Note: For embedded methods, the receiver type
+			// should be the type of the interface that declared
+			// the methods in the first place. Since we get the
+			// methods here via methodInfo, which may be computed
+			// before we have all relevant interface types, we use
+			// the current interface's type (recvType). This may be
+			// the type of the interface embedding the interface that
+			// declared the methods. This doesn't matter for type-
+			// checking (we only care about the receiver type for
+			// the ptrRecv predicate, and it's never a pointer recv
+			// for interfaces), but it matters for go/types clients
+			// and for printing. We correct the receiver after type-
+			// checking.
+			//
 			// TODO(gri) Consider marking methods signatures
 			// as incomplete, for better error messages. See
 			// also the T4 and T5 tests in testdata/cycles2.src.
