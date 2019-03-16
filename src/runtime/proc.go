@@ -552,6 +552,8 @@ func schedinit() {
 	parsedebugvars()
 	gcinit()
 
+	prepareGoPool()
+
 	sched.lastpoll = uint64(nanotime())
 	procs := ncpu
 	if n, ok := atoi32(gogetenv("GOMAXPROCS")); ok && n > 0 {
@@ -560,6 +562,8 @@ func schedinit() {
 	if procresize(procs) != nil {
 		throw("unknown runnable goroutine during bootstrap")
 	}
+
+	prepareGoPPoolTable()
 
 	// For cgocheck > 1, we turn on the write barrier at all times
 	// and check all pointer writes. We can't do this until after
@@ -653,10 +657,7 @@ func ready(gp *g, traceskip int, next bool) {
 
 	// status is Gwaiting or Gscanwaiting, make Grunnable and put on runq
 	casgstatus(gp, _Gwaiting, _Grunnable)
-	runqput(_g_.m.p.ptr(), gp, next)
-	if atomic.Load(&sched.npidle) != 0 && atomic.Load(&sched.nmspinning) == 0 {
-		wakep()
-	}
+	gopool.runqputWithWakep(_g_.m.p.ptr(), gp, next)
 	_g_.m.locks--
 	if _g_.m.locks == 0 && _g_.preempt { // restore the preemption request in Case we've cleared it in newstack
 		_g_.stackguard0 = stackPreempt
@@ -1032,13 +1033,15 @@ func stopTheWorldWithSema() {
 		}
 	}
 	// stop idle P's
-	for {
-		p := pidleget()
-		if p == nil {
-			break
+	for poolid, _ := range gopool.ppooltable {
+		for {
+			p := pidleget(poolid)
+			if p == nil {
+				break
+			}
+			p.status = _Pgcstop
+			sched.stopwait--
 		}
-		p.status = _Pgcstop
-		sched.stopwait--
 	}
 	wait := sched.stopwait > 0
 	unlock(&sched.lock)
@@ -1128,8 +1131,11 @@ func startTheWorldWithSema(emitTraceEvent bool) int64 {
 	// Wakeup an additional proc in case we have excessive runnable goroutines
 	// in local queues or in the global queue. If we don't, the proc will park itself.
 	// If we have lots of excessive work, resetspinning will unpark additional procs as necessary.
-	if atomic.Load(&sched.npidle) != 0 && atomic.Load(&sched.nmspinning) == 0 {
-		wakep()
+	for poolid, _ := range gopool.ppooltable {
+		if gopool.GetSchedPoolNPidle(poolid) != 0 && atomic.Load(&sched.nmspinning) == 0 {
+			wakep(poolid)
+			break
+		}
 	}
 
 	_g_.m.locks--
@@ -1359,10 +1365,12 @@ func forEachP(fn func(*p)) {
 
 	// Run safe point function for all idle Ps. sched.pidle will
 	// not change because we hold sched.lock.
-	for p := sched.pidle.ptr(); p != nil; p = p.link.ptr() {
-		if atomic.Cas(&p.runSafePointFn, 1, 0) {
-			fn(p)
-			sched.safePointWait--
+	for poolid, _ := range gopool.ppooltable {
+		for p := gopool.GetSchedPoolPidle(poolid).ptr(); p != nil; p = p.link.ptr() {
+			if atomic.Cas(&p.runSafePointFn, 1, 0) {
+				fn(p)
+				sched.safePointWait--
+			}
 		}
 	}
 
@@ -1950,10 +1958,10 @@ func mspinning() {
 // If spinning is set, the caller has incremented nmspinning and startm will
 // either decrement nmspinning or set m.spinning in the newly started M.
 //go:nowritebarrierrec
-func startm(_p_ *p, spinning bool) {
+func startm(gopoolid int, _p_ *p, spinning bool) {
 	lock(&sched.lock)
 	if _p_ == nil {
-		_p_ = pidleget()
+		_p_ = pidleget(gopoolid)
 		if _p_ == nil {
 			unlock(&sched.lock)
 			if spinning {
@@ -2000,19 +2008,19 @@ func handoffp(_p_ *p) {
 	// findrunnable would return a G to run on _p_.
 
 	// if it has local work, start it straight away
-	if !runqempty(_p_) || sched.runqsize != 0 {
-		startm(_p_, false)
+	if !runqempty(_p_) || gopool.GoPoolRunqSize(_p_.lockedpoolid) != 0 {
+		startm(_p_.lockedpoolid, _p_, false)
 		return
 	}
 	// if it has GC work, start it straight away
 	if gcBlackenEnabled != 0 && gcMarkWorkAvailable(_p_) {
-		startm(_p_, false)
+		startm(_p_.lockedpoolid, _p_, false)
 		return
 	}
 	// no local work, check that there are no spinning/idle M's,
 	// otherwise our help is not required
-	if atomic.Load(&sched.nmspinning)+atomic.Load(&sched.npidle) == 0 && atomic.Cas(&sched.nmspinning, 0, 1) { // TODO: fast atomic
-		startm(_p_, true)
+	if atomic.Load(&sched.nmspinning)+gopool.GetSchedPoolNPidle(_p_.lockedpoolid) == 0 && atomic.Cas(&sched.nmspinning, 0, 1) { // TODO: fast atomic
+		startm(_p_.lockedpoolid, _p_, true)
 		return
 	}
 	lock(&sched.lock)
@@ -2032,16 +2040,17 @@ func handoffp(_p_ *p) {
 			notewakeup(&sched.safePointNote)
 		}
 	}
-	if sched.runqsize != 0 {
+	if gopool.GoPoolRunqSize(_p_.lockedpoolid) != 0 {
 		unlock(&sched.lock)
-		startm(_p_, false)
+		startm(_p_.lockedpoolid, _p_, false)
 		return
 	}
 	// If this is the last running P and nobody is polling network,
 	// need to wakeup another M to poll network.
-	if sched.npidle == uint32(gomaxprocs-1) && atomic.Load64(&sched.lastpoll) != 0 {
+	procs := gopool.GetPPoolPCount(_p_.lockedpoolid)
+	if gopool.GetSchedPoolNPidle(_p_.lockedpoolid) == uint32(procs-1) && atomic.Load64(&sched.lastpoll) != 0 {
 		unlock(&sched.lock)
-		startm(_p_, false)
+		startm(_p_.lockedpoolid, _p_, false)
 		return
 	}
 	pidleput(_p_)
@@ -2050,12 +2059,12 @@ func handoffp(_p_ *p) {
 
 // Tries to add one more P to execute G's.
 // Called when a G is made runnable (newproc, ready).
-func wakep() {
+func wakep(poolid int) {
 	// be conservative about spinning threads
 	if !atomic.Cas(&sched.nmspinning, 0, 1) {
 		return
 	}
-	startm(nil, true)
+	startm(poolid, nil, true)
 }
 
 // Stops execution of the current m that is locked to a g until the g is runnable again.
@@ -2184,6 +2193,7 @@ func findrunnable() (gp *g, inheritTime bool) {
 
 top:
 	_p_ := _g_.m.p.ptr()
+	poolid := _p_.lockedpoolid
 	if sched.gcwaiting != 0 {
 		gcstopm()
 		goto top
@@ -2206,7 +2216,7 @@ top:
 	}
 
 	// global runq
-	if sched.runqsize != 0 {
+	if gopool.GoPoolRunqSize(poolid) != 0 {
 		lock(&sched.lock)
 		gp := globrunqget(_p_, 0)
 		unlock(&sched.lock)
@@ -2235,8 +2245,8 @@ top:
 	}
 
 	// Steal work from other P's.
-	procs := uint32(gomaxprocs)
-	if atomic.Load(&sched.npidle) == procs-1 {
+	procs := uint32(gopool.GetPPoolPCount(poolid))
+	if gopool.GetSchedPoolNPidle(poolid) == procs-1 {
 		// Either GOMAXPROCS=1 or everybody, except for us, is idle already.
 		// New work can appear from returning syscall/cgocall, network or timers.
 		// Neither of that submits to local run queues, so no point in stealing.
@@ -2245,7 +2255,7 @@ top:
 	// If number of spinning M's >= number of busy P's, block.
 	// This is necessary to prevent excessive CPU consumption
 	// when GOMAXPROCS>>1 but the program parallelism is low.
-	if !_g_.m.spinning && 2*atomic.Load(&sched.nmspinning) >= procs-atomic.Load(&sched.npidle) {
+	if !_g_.m.spinning && 2*atomic.Load(&sched.nmspinning) >= procs-gopool.GetSchedPoolNPidle(poolid) {
 		goto stop
 	}
 	if !_g_.m.spinning {
@@ -2299,7 +2309,7 @@ stop:
 		unlock(&sched.lock)
 		goto top
 	}
-	if sched.runqsize != 0 {
+	if gopool.GoPoolRunqSize(poolid) != 0 {
 		gp := globrunqget(_p_, 0)
 		unlock(&sched.lock)
 		return gp, false
@@ -2333,9 +2343,13 @@ stop:
 
 	// check all runqueues once again
 	for _, _p_ := range allpSnapshot {
+		if _p_.lockedpoolid != poolid {
+			continue
+		}
+
 		if !runqempty(_p_) {
 			lock(&sched.lock)
-			_p_ = pidleget()
+			_p_ = pidleget(poolid)
 			unlock(&sched.lock)
 			if _p_ != nil {
 				acquirep(_p_)
@@ -2352,7 +2366,7 @@ stop:
 	// Check for idle-priority GC work again.
 	if gcBlackenEnabled != 0 && gcMarkWorkAvailable(nil) {
 		lock(&sched.lock)
-		_p_ = pidleget()
+		_p_ = pidleget(poolid)
 		if _p_ != nil && _p_.gcBgMarkWorker == 0 {
 			pidleput(_p_)
 			_p_ = nil
@@ -2381,7 +2395,7 @@ stop:
 		atomic.Store64(&sched.lastpoll, uint64(nanotime()))
 		if !list.empty() {
 			lock(&sched.lock)
-			_p_ = pidleget()
+			_p_ = pidleget(poolid)
 			unlock(&sched.lock)
 			if _p_ != nil {
 				acquirep(_p_)
@@ -2405,10 +2419,10 @@ stop:
 // background work loops, like idle GC. It checks a subset of the
 // conditions checked by the actual scheduler.
 func pollWork() bool {
-	if sched.runqsize != 0 {
+	p := getg().m.p.ptr()
+	if gopool.GoPoolRunqSize(p.lockedpoolid) != 0 {
 		return true
 	}
-	p := getg().m.p.ptr()
 	if !runqempty(p) {
 		return true
 	}
@@ -2434,8 +2448,8 @@ func resetspinning() {
 	// M wakeup policy is deliberately somewhat conservative, so check if we
 	// need to wakeup another P here. See "Worker thread parking/unparking"
 	// comment at the top of the file for details.
-	if nmspinning == 0 && atomic.Load(&sched.npidle) > 0 {
-		wakep()
+	if nmspinning == 0 && gopool.GetSchedPoolNPidle(_g_.lockedpoolid) > 0 {
+		wakep(_g_.lockedpoolid)
 	}
 }
 
@@ -2451,16 +2465,16 @@ func injectglist(glist *gList) {
 		}
 	}
 	lock(&sched.lock)
-	var n int
+	var n int32
 	for n = 0; !glist.empty(); n++ {
 		gp := glist.pop()
 		casgstatus(gp, _Gwaiting, _Grunnable)
 		globrunqput(gp)
 	}
 	unlock(&sched.lock)
-	for ; n != 0 && sched.npidle != 0; n-- {
-		startm(nil, false)
-	}
+
+	gopool.StartAllSchedPoolPidle(n, false)
+
 	*glist = gList{}
 }
 
@@ -2509,9 +2523,10 @@ top:
 		// Check the global runnable queue once in a while to ensure fairness.
 		// Otherwise two goroutines can completely occupy the local runqueue
 		// by constantly respawning each other.
-		if _g_.m.p.ptr().schedtick%61 == 0 && sched.runqsize > 0 {
+		p := _g_.m.p.ptr()
+		if _g_.m.p.ptr().schedtick%61 == 0 && gopool.GoPoolRunqSize(p.lockedpoolid) > 0 {
 			lock(&sched.lock)
-			gp = globrunqget(_g_.m.p.ptr(), 1)
+			gp = globrunqget(p, 1)
 			unlock(&sched.lock)
 		}
 	}
@@ -3035,10 +3050,10 @@ func exitsyscallfast(oldp *p) bool {
 	}
 
 	// Try to get any other idle P.
-	if sched.pidle != 0 {
+	if *gopool.GetSchedPoolPidle(_g_.lockedpoolid) != 0 {
 		var ok bool
 		systemstack(func() {
-			ok = exitsyscallfast_pidle()
+			ok = exitsyscallfast_pidle(_g_.lockedpoolid)
 			if ok && trace.enabled {
 				if oldp != nil {
 					// Wait till traceGoSysBlock event is emitted.
@@ -3080,9 +3095,9 @@ func exitsyscallfast_reacquired() {
 	}
 }
 
-func exitsyscallfast_pidle() bool {
+func exitsyscallfast_pidle(poolid int) bool {
 	lock(&sched.lock)
-	_p_ := pidleget()
+	_p_ := pidleget(poolid)
 	if _p_ != nil && atomic.Load(&sched.sysmonwait) != 0 {
 		atomic.Store(&sched.sysmonwait, 0)
 		notewakeup(&sched.sysmonnote)
@@ -3107,7 +3122,7 @@ func exitsyscall0(gp *g) {
 	lock(&sched.lock)
 	var _p_ *p
 	if schedEnabled(_g_) {
-		_p_ = pidleget()
+		_p_ = pidleget(_g_.lockedpoolid)
 	}
 	if _p_ == nil {
 		globrunqput(gp)
@@ -3274,6 +3289,7 @@ func newproc1(fn *funcval, argp *uint8, narg int32, callergp *g, callerpc uintpt
 		casgstatus(newg, _Gidle, _Gdead)
 		allgadd(newg) // publishes with a g->status of Gdead so GC scanner doesn't look at uninitialized stack.
 	}
+	newg.lockedpoolid = callergp.lockedpoolid
 	if newg.stack.hi == 0 {
 		throw("newproc1: newg missing stack")
 	}
@@ -3347,8 +3363,9 @@ func newproc1(fn *funcval, argp *uint8, narg int32, callergp *g, callerpc uintpt
 	}
 	runqput(_p_, newg, true)
 
-	if atomic.Load(&sched.npidle) != 0 && atomic.Load(&sched.nmspinning) == 0 && mainStarted {
-		wakep()
+	if gopool.GetSchedPoolNPidle(_p_.lockedpoolid) != 0 &&
+		atomic.Load(&sched.nmspinning) == 0 && mainStarted {
+		wakep(_p_.lockedpoolid)
 	}
 	_g_.m.locks--
 	if _g_.m.locks == 0 && _g_.preempt { // restore the preemption request in case we've cleared it in newstack
@@ -4219,7 +4236,7 @@ func checkdead() {
 	if gp != nil {
 		casgstatus(gp, _Gwaiting, _Grunnable)
 		globrunqput(gp)
-		_p_ := pidleget()
+		_p_ := pidleget(gp.lockedpoolid)
 		if _p_ == nil {
 			throw("checkdead: no p for timer")
 		}
@@ -4280,9 +4297,11 @@ func sysmon() {
 			delay = 10 * 1000
 		}
 		usleep(delay)
-		if debug.schedtrace <= 0 && (sched.gcwaiting != 0 || atomic.Load(&sched.npidle) == uint32(gomaxprocs)) {
+		if debug.schedtrace <= 0 &&
+			(sched.gcwaiting != 0 || gopool.GetSchedPoolNPidleSum() == uint32(gomaxprocs)) {
 			lock(&sched.lock)
-			if atomic.Load(&sched.gcwaiting) != 0 || atomic.Load(&sched.npidle) == uint32(gomaxprocs) {
+			if atomic.Load(&sched.gcwaiting) != 0 ||
+				gopool.GetSchedPoolNPidleSum() == uint32(gomaxprocs) {
 				atomic.Store(&sched.sysmonwait, 1)
 				unlock(&sched.lock)
 				// Make wake-up period small enough
@@ -4405,7 +4424,9 @@ func retake(now int64) uint32 {
 			// On the one hand we don't want to retake Ps if there is no other work to do,
 			// but on the other hand we want to retake them eventually
 			// because they can prevent the sysmon thread from deep sleep.
-			if runqempty(_p_) && atomic.Load(&sched.nmspinning)+atomic.Load(&sched.npidle) > 0 && pd.syscallwhen+10*1000*1000 > now {
+			if runqempty(_p_) &&
+				atomic.Load(&sched.nmspinning)+gopool.GetSchedPoolNPidleSum() > 0 &&
+				pd.syscallwhen+10*1000*1000 > now {
 				continue
 			}
 			// Drop allpLock so we can take sched.lock.
@@ -4501,7 +4522,7 @@ func schedtrace(detailed bool) {
 	}
 
 	lock(&sched.lock)
-	print("SCHED ", (now-starttime)/1e6, "ms: gomaxprocs=", gomaxprocs, " idleprocs=", sched.npidle, " threads=", mcount(), " spinningthreads=", sched.nmspinning, " idlethreads=", sched.nmidle, " runqueue=", sched.runqsize)
+	print("SCHED ", (now-starttime)/1e6, "ms: gomaxprocs=", gomaxprocs, " idleprocs=", gopool.GetSchedPoolNPidleSum(), " threads=", mcount(), " spinningthreads=", sched.nmspinning, " idlethreads=", sched.nmidle, " runqueue=", gopool.GoPoolRunqSize(-1))
 	if detailed {
 		print(" gcwaiting=", sched.gcwaiting, " nmidlelocked=", sched.nmidlelocked, " stopwait=", sched.stopwait, " sysmonwait=", sched.sysmonwait, "\n")
 	}
@@ -4592,9 +4613,7 @@ func schedEnableUser(enable bool) {
 		sched.disable.n = 0
 		globrunqputbatch(&sched.disable.runnable, n)
 		unlock(&sched.lock)
-		for ; n != 0 && sched.npidle != 0; n-- {
-			startm(nil, false)
-		}
+		gopool.StartAllSchedPoolPidle(n, false)
 	} else {
 		unlock(&sched.lock)
 	}
@@ -4638,8 +4657,8 @@ func mget() *m {
 // May run during STW, so write barriers are not allowed.
 //go:nowritebarrierrec
 func globrunqput(gp *g) {
-	sched.runq.pushBack(gp)
-	sched.runqsize++
+	*gopool.GetSchedRunqSize(gp.lockedpoolid) += 1
+	gopool.GetSchedRunq(gp.lockedpoolid).pushBack(gp)
 }
 
 // Put gp at the head of the global runnable queue.
@@ -4647,29 +4666,43 @@ func globrunqput(gp *g) {
 // May run during STW, so write barriers are not allowed.
 //go:nowritebarrierrec
 func globrunqputhead(gp *g) {
-	sched.runq.push(gp)
-	sched.runqsize++
+	*gopool.GetSchedRunqSize(gp.lockedpoolid) += 1
+	gopool.GetSchedRunq(gp.lockedpoolid).push(gp)
 }
 
 // Put a batch of runnable goroutines on the global runnable queue.
 // This clears *batch.
 // Sched must be locked.
 func globrunqputbatch(batch *gQueue, n int32) {
-	sched.runq.pushBackAll(*batch)
-	sched.runqsize += n
+	var (
+		ghead  = batch.head.ptr()
+		gtail  = batch.tail.ptr()
+		nextgp *g
+	)
+
+	gtail.schedlink = 0
+
+	for gp := ghead; gp != nil; gp = nextgp {
+		nextgp = gp.schedlink.ptr()
+		*gopool.GetSchedRunqSize(gp.lockedpoolid) += 1
+		gopool.GetSchedRunq(gp.lockedpoolid).pushBack(gp)
+	}
+
 	*batch = gQueue{}
 }
 
 // Try get a batch of G's from the global runnable queue.
 // Sched must be locked.
 func globrunqget(_p_ *p, max int32) *g {
-	if sched.runqsize == 0 {
+	procs := int32(gopool.GetPPoolPCount(_p_.lockedpoolid))
+	poolRunqSize := gopool.GetSchedRunqSize(_p_.lockedpoolid)
+	if *poolRunqSize == 0 {
 		return nil
 	}
 
-	n := sched.runqsize/gomaxprocs + 1
-	if n > sched.runqsize {
-		n = sched.runqsize
+	n := *poolRunqSize/procs + 1
+	if n > *poolRunqSize {
+		n = *poolRunqSize
 	}
 	if max > 0 && n > max {
 		n = max
@@ -4678,12 +4711,12 @@ func globrunqget(_p_ *p, max int32) *g {
 		n = int32(len(_p_.runq)) / 2
 	}
 
-	sched.runqsize -= n
-
-	gp := sched.runq.pop()
+	*poolRunqSize -= n
+	poolRunq := gopool.GetSchedRunq(_p_.lockedpoolid)
+	gp := poolRunq.pop()
 	n--
 	for ; n > 0; n-- {
-		gp1 := sched.runq.pop()
+		gp1 := poolRunq.pop()
 		runqput(_p_, gp1, false)
 	}
 	return gp
@@ -4697,22 +4730,16 @@ func pidleput(_p_ *p) {
 	if !runqempty(_p_) {
 		throw("pidleput: P has non-empty run queue")
 	}
-	_p_.link = sched.pidle
-	sched.pidle.set(_p_)
-	atomic.Xadd(&sched.npidle, 1) // TODO: fast atomic
+	_p_.link = *gopool.GetSchedPoolPidle(_p_.lockedpoolid)
+	gopool.PushSchedPoolPidle(_p_.lockedpoolid, _p_)
 }
 
 // Try get a p from _Pidle list.
 // Sched must be locked.
 // May run during STW, so write barriers are not allowed.
 //go:nowritebarrierrec
-func pidleget() *p {
-	_p_ := sched.pidle.ptr()
-	if _p_ != nil {
-		sched.pidle = _p_.link
-		atomic.Xadd(&sched.npidle, -1) // TODO: fast atomic
-	}
-	return _p_
+func pidleget(poolid int) *p {
+	return gopool.PopSchedPoolPidle(poolid)
 }
 
 // runqempty reports whether _p_ has no Gs on its local run queue.
@@ -5115,7 +5142,7 @@ func sync_runtime_canSpin(i int) bool {
 	// GOMAXPROCS>1 and there is at least one other running P and local runq is empty.
 	// As opposed to runtime mutex we don't do passive spinning here,
 	// because there can be work on global runq or on other Ps.
-	if i >= active_spin || ncpu <= 1 || gomaxprocs <= int32(sched.npidle+sched.nmspinning)+1 {
+	if i >= active_spin || ncpu <= 1 || gomaxprocs <= int32(gopool.GetSchedPoolNPidleSum()+sched.nmspinning)+1 {
 		return false
 	}
 	if p := getg().m.p.ptr(); !runqempty(p) {

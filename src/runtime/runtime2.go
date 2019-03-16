@@ -399,6 +399,8 @@ type g struct {
 	// and check for debt in the malloc hot path. The assist ratio
 	// determines how this corresponds to scan work debt.
 	gcAssistBytes int64
+
+	lockedpoolid int
 }
 
 type m struct {
@@ -550,6 +552,8 @@ type p struct {
 	runSafePointFn uint32 // if 1, run sched.safePointFn at next safe point
 
 	pad cpu.CacheLinePad
+
+	lockedpoolid int
 }
 
 type schedt struct {
@@ -572,13 +576,15 @@ type schedt struct {
 
 	ngsys uint32 // number of system goroutines; updated atomically
 
-	pidle      puintptr // idle p's
-	npidle     uint32
+	poolpidle      []puintptr // idle p's
+	poolnpidle     []uint32
+	poolnpidle_sum uint32
+
 	nmspinning uint32 // See "Worker thread parking/unparking" comment in proc.go.
 
 	// Global runnable queue.
-	runq     gQueue
-	runqsize int32
+	poolrunq     []gQueue
+	poolrunqsize []int32
 
 	// disable controls selective disabling of the scheduler.
 	//
